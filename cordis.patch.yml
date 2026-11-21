@@ -1,0 +1,22 @@
+- insert:
+    - id: reboot-resume
+      name: '@local/reboot-resume'
+      config:
+        # One-time composition edit: append this package as a tool-only row to
+        # the standard agent preset, where the agent's model-visible tools are
+        # composed. The edit is idempotent.
+        ensurePreset: true
+        # This profile explicitly opted into unattended reboots. Set to false
+        # to require the approval prompt again.
+        allowUnattended: true
+        # Command array, no shell interpolation. Use
+        # ['sudo', '-n', 'systemctl', 'reboot'] only if NOPASSWD is configured.
+        rebootCommand:
+          - systemctl
+          - reboot
+        # Grace period before the reboot request, so the tool result and the
+        # closed turn reach durable session storage first.
+        rebootDelaySeconds: 5
+        # Safety net if the boot-id fast path cannot run: the scheduled task
+        # delivers the continuation this long after the reboot request.
+        fallbackDelaySeconds: 90

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Reboot and resume",
+    "description": "Restarts the computer on request and automatically continues the interrupted chat after the harness starts again."
+  }
+}
