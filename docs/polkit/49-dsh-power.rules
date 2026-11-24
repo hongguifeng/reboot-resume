@@ -1,0 +1,43 @@
+// Allow the DeepSeek Harness host to reboot or power off without an
+// interactive PolicyKit prompt.
+//
+// DSH runs as a systemd *user* service (dsh-web.service) and therefore has no
+// logind session of its own. The default login1 policy is
+//
+//   <allow_active>yes</allow_active>
+//   <allow_inactive>auth_admin_keep</allow_inactive>
+//
+// so the service only passes while a temporary authorization happens to be
+// cached; once it expires, CanReboot/CanPowerOff answer "challenge" and the
+// reboot/cold-boot tools correctly refuse to act. This rule pins the decision
+// for the DSH user instead of relying on that cache.
+//
+// Kept to ES5 syntax on purpose: polkit 124 on Ubuntu 24.04 evaluates rules
+// with duktape, where let/const support is partial.
+//
+// Install:
+//   sudo install -m 0644 49-dsh-power.rules /etc/polkit-1/rules.d/
+//
+// Verify (the host pid is the service's main pid):
+//   pkcheck --action-id org.freedesktop.login1.reboot --process <pid>; echo $?
+//
+// Remove:
+//   sudo rm /etc/polkit-1/rules.d/49-dsh-power.rules
+
+var DSH_USER = 'hong';
+
+polkit.addRule(function (action, subject) {
+    if (subject.user !== DSH_USER) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var allowed = [
+        'org.freedesktop.login1.reboot',
+        'org.freedesktop.login1.reboot-multiple-sessions',
+        'org.freedesktop.login1.power-off',
+        'org.freedesktop.login1.power-off-multiple-sessions'
+    ];
+    if (allowed.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

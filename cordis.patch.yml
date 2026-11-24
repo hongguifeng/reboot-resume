@@ -6,6 +6,10 @@
         # the standard agent preset, where the agent's model-visible tools are
         # composed. The edit is idempotent.
         ensurePreset: true
+        # Pin the state directory: the Host process itself has no DSH_PROFILE in
+        # its environment and would otherwise fall back to .../default, while
+        # tools/probe.mjs (started from a DSH subprocess) resolves .../web.
+        pendingDir: /home/hong/.dsh/reboot-resume/web
         # This profile explicitly opted into unattended reboots. Set to false
         # to require the approval prompt again.
         allowUnattended: true
@@ -20,3 +24,72 @@
         # Safety net if the boot-id fast path cannot run: the scheduled task
         # delivers the continuation this long after the reboot request.
         fallbackDelaySeconds: 90
+        # Cold boot: cut mains power through a Wi-Fi smart plug, then let the
+        # machine start from a true cold state. The machine cannot power itself
+        # back on, so a restore path is required before anything is switched.
+        #
+        # Get the plug address and miIO token once with:
+        #   node tools/probe.mjs login --user <小米账号> --password '<密码>'
+        #   node tools/probe.mjs status
+        # The probe caches localip + token in
+        # $DSH_HOME/reboot-resume/<profile>/plug.json (0600); the plugin reuses
+        # that cache, so the account password is not needed at runtime.
+        coldBoot:
+          enabled: true
+          # Explicit host/token skip the cloud cache entirely. token is a
+          # secret; prefer the probe cache instead of pasting it here.
+          plug:
+            host: ''
+            token: ''
+            selector:
+              did: ''
+              name: ''
+              model: ''
+            # MIoT spec ids of the relay (switch). 2/1 is correct for the
+            # chuangmi.plug.212a01 "米家智能插座2"; older plugs fall back to
+            # the legacy get_prop/set_power methods automatically.
+            switch:
+              siid: 2
+              piid: 1
+          account:
+            # Only used when there is no fresh cache; the password comes from
+            # XIAOMI_PASSWORD or the DSH credential record
+            # reboot-resume/xiaomi-account, never from this file.
+            username: ''
+          # Cold boot is a sequence, not a single action:
+          #   1. arm the continuation and hand the power cycle to the restore
+          #      mechanism;
+          #   2. shut down cleanly (haltCommand) after shutdownGraceSeconds;
+          #   3. the restore mechanism cuts mains power once the machine is
+          #      down (powerCutDelaySeconds) and restores it after
+          #      outageSeconds, so the PSU fully discharges and the BIOS sees a
+          #      real power-on.
+          haltCommand:
+            - systemctl
+            - poweroff
+          shutdownGraceSeconds: 5
+          powerCutDelaySeconds: 30
+          outageSeconds: 30
+          restore:
+            # 'manual' needs allowManualRestore below; 'command' runs this argv
+            # before the shutdown; 'jump' ships pre-signed cloud requests to an
+            # always-on SSH host that cuts and restores power afterwards.
+            mode: jump
+            command: []
+            jump:
+              # Padavan router, key-only auth, has openssl + base64.
+              host: admin@192.168.8.2
+              identity: /home/hong/.ssh/dsh_jump
+              apiHost: api.io.mi.com
+              sshOptions:
+                - "-o"
+                - "BatchMode=yes"
+                - "-o"
+                - "StrictHostKeyChecking=accept-new"
+                - "-o"
+                - "ConnectTimeout=8"
+            leadSeconds: 120
+          # Interim setting: the user flips the plug back on by hand until a
+          # jump host is configured. Set to false to make manual restore a
+          # hard blocker.
+          allowManualRestore: true

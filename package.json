@@ -1,6 +1,6 @@
 {
   "name": "@local/reboot-resume",
-  "version": "1.0.5",
+  "version": "1.4.0",
   "private": true,
   "description": "Lets the agent reboot the computer and automatically continue the interrupted session after DSH restarts.",
   "type": "module",
@@ -12,6 +12,8 @@
   "files": [
     "README.md",
     "index.js",
+    "lib",
+    "tools",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"
@@ -20,5 +22,9 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "probe": "node tools/probe.mjs"
   }
 }

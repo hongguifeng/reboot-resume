@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Reboot and resume",
-    "description": "Restarts the computer on request and automatically continues the interrupted chat after the harness starts again."
+    "description": "Restarts the computer, or cold-boots it through a smart plug, and automatically continues the interrupted chat after the harness starts again."
   }
 }

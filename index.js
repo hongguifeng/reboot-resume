@@ -27,6 +27,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { normalizeColdBoot, planColdBoot, runRestoreCommand } from './lib/cold-boot.js';
+import { armJumpRestore, buildPowerRequest, preflightJump } from './lib/jump-host.js';
+import { plugStatus, readCache, resolvePlug } from './lib/plug.js';
+import { cloudGetProperty } from './lib/xiaomi-cloud.js';
+
 /** Loader plugin name. */
 export const name = 'reboot-resume';
 /** Host services required before the tool and startup hook are installed. */
@@ -46,15 +51,6 @@ const MAX_TITLE = 120;
 const MAX_APPROVAL_REASON = 500;
 /** Default reboot command; config may replace it with an argv array. */
 const DEFAULT_REBOOT_COMMAND = ['systemctl', 'reboot'];
-/** Bus/polkit action used by systemd-logind for a reboot. */
-const LOGIN1_REBOOT_ARGS = [
-  'call',
-  'org.freedesktop.login1',
-  '/org/freedesktop/login1',
-  'org.freedesktop.login1.Manager',
-  'CanReboot',
-];
-
 /** Tool description used when the profile keeps the approval prompt. */
 const TOOL_DESCRIPTION_ASK =
   'Restart the whole computer and automatically continue this session after DeepSeek Harness starts again. '
@@ -90,6 +86,27 @@ const SYSTEM_PROMPT_UNATTENDED =
   + 'unattended reboots, so the tool does not prompt; still do not restart speculatively. Never claim a reboot '
   + 'happened before the tool returns `reboot_scheduled`. After the restart an automatic continuation message '
   + 'arrives in this session; do not schedule another reminder for the same reboot.';
+
+/** Model-facing tool name for the cold boot (mains power cycle). */
+const COLD_BOOT_TOOL_NAME = 'system_cold_boot';
+
+/** Tool description for the cold boot tool. */
+const COLD_BOOT_DESCRIPTION =
+  'Cold-boot the whole computer: shut it down cleanly, cut mains power through a Wi-Fi smart plug once the shutdown '
+  + 'finished, restore power after the PSU has discharged, then continue this session automatically after DeepSeek '
+  + 'Harness starts again. Use it only when the user explicitly asks for a cold boot or when a warm reboot is not '
+  + 'enough (for example PCIe or GPU devices that only re-enumerate after AC power loss). The call arms a durable '
+  + 'continuation, then hands the delayed power cut and restore to the configured out-of-band restore path, then '
+  + 'shuts the machine down; the machine cannot power itself back on. Never claim anything happened before the tool '
+  + 'returns `cold_boot_started`. Set `dry_run` to inspect the plug, the restore path, and the planned sequence '
+  + 'without changing anything.';
+
+/** System-prompt guidance for the cold boot tool. */
+const COLD_BOOT_PROMPT =
+  '`system_cold_boot` shuts the machine down, then a smart plug cuts mains power and restores it; the computer '
+  + 'cannot turn itself back on, so the configured jump host or the user must restore power. Use it only when a warm '
+  + 'reboot cannot solve the problem. Never claim a cold boot happened before the tool returns `cold_boot_started`. '
+  + 'Set `dry_run` to check the plug, the restore path, and the polkit permission first.';
 
 /**
  * Select the model-facing description for the configured approval mode.
@@ -224,6 +241,19 @@ function registerPromptSection(ctx, deps) {
       }
     },
   });
+  if (deps.config.coldBoot.enabled) {
+    ctx.systemPrompt.section({
+      name: 'tool:system-cold-boot',
+      order: order + 1,
+      text: ({ scope }) => {
+        try {
+          return ctx.tools.get(COLD_BOOT_TOOL_NAME, scope) === undefined ? '' : COLD_BOOT_PROMPT;
+        } catch {
+          return '';
+        }
+      },
+    });
+  }
 }
 
 /**
@@ -261,6 +291,14 @@ async function ensurePresetToolRow(ctx, config, log) {
       rebootDelaySeconds: config.rebootDelaySeconds,
       fallbackDelaySeconds: config.fallbackDelaySeconds,
       staleAfterSeconds: Math.round(config.staleMs / 1000),
+      // The preset instance executes the tools, so it needs the cold-boot
+      // settings too. The account password is deliberately not copied: the
+      // host instance signs in and caches the plug token, and the preset
+      // instance reads that cache or the credential store.
+      coldBoot: {
+        ...config.coldBoot,
+        account: { ...config.coldBoot.account, password: '' },
+      },
     },
   };
   await editor.edit(entry, (current, inherited) => {
@@ -269,9 +307,10 @@ async function ensurePresetToolRow(ctx, config, log) {
     const base = (currentPlugins ?? inheritedPlugins).slice();
     const index = base.findIndex((row) => row !== null && typeof row === 'object' && row.id === toolRow.id);
     if (index >= 0) {
-      const existing = base[index];
-      if (existing.name === toolRow.name) return { ...inherited, ...current };
-      base[index] = { ...existing, ...toolRow };
+      // Always rewrite the row: an existing row with the same name can still
+      // carry an older config (for example an older cold-boot timing), and
+      // skipping the write would silently keep stale settings forever.
+      base[index] = { ...toolRow };
       return { ...inherited, ...current, plugins: base };
     }
     return { ...inherited, ...current, plugins: [...base, toolRow] };
@@ -329,7 +368,7 @@ async function ensurePresetToolRow(ctx, config, log) {
  */
 function registerTool(ctx, deps) {
   const { log } = deps;
-  return ctx.tools.register({
+  const disposers = [ctx.tools.register({
     name: TOOL_NAME,
     description: toolDescription(deps.config),
     parameters: PARAMETERS_SCHEMA,
@@ -353,7 +392,45 @@ function registerTool(ctx, deps) {
         return fail('internal_error', '重启请求在安排重启前失败，未执行重启。');
       }
     },
-  });
+  })];
+
+  if (deps.config.coldBoot.enabled) {
+    disposers.push(ctx.tools.register({
+      name: COLD_BOOT_TOOL_NAME,
+      description: COLD_BOOT_DESCRIPTION,
+      parameters: PARAMETERS_SCHEMA,
+      output: { schema: OUTPUT_SCHEMA, render },
+      presentCall(rawArgs) {
+        const reason = rawArgs && typeof rawArgs === 'object' && typeof rawArgs.reason === 'string'
+          ? rawArgs.reason
+          : undefined;
+        return {
+          card: 'generic',
+          title: 'Cold boot and resume',
+          kind: 'other',
+          rawInput: reason === undefined ? undefined : { reason },
+        };
+      },
+      async execute(rawArgs, exec) {
+        try {
+          return await runColdBoot(ctx, rawArgs, exec, deps);
+        } catch (error) {
+          log.error(`system_cold_boot failed: ${safeErrorMessage(error)}`);
+          return fail('internal_error', '冷启动请求在断电前失败，未执行断电。');
+        }
+      },
+    }));
+  }
+
+  return () => {
+    for (const dispose of disposers) {
+      try {
+        dispose?.();
+      } catch {
+        // A registry disposer that already ran is not an error here.
+      }
+    }
+  };
 }
 
 /**
@@ -605,12 +682,441 @@ async function runTool(ctx, rawArgs, exec, deps) {
 }
 
 /**
+ * Resolve Xiaomi account credentials from configuration, the environment, or
+ * the DSH credential store, in that order.
+ * @param ctx - Plugin scope that may expose the credential store.
+ * @param coldBoot - Normalized cold-boot config.
+ * @returns Username and password (either may be empty).
+ */
+async function resolveAccount(ctx, coldBoot) {
+  let username = coldBoot.account.username;
+  let password = coldBoot.account.password;
+  if (username === '') username = process.env.XIAOMI_USERNAME ?? '';
+  if (password === '') password = process.env.XIAOMI_PASSWORD ?? '';
+  if (username !== '' && password !== '') return { username, password };
+
+  const store = typeof ctx.get === 'function' ? ctx.get('credentials') : undefined;
+  if (store === undefined || typeof store.readRecord !== 'function') return { username, password };
+  try {
+    const record = await store.readRecord('reboot-resume/xiaomi-account');
+    const payload = record?.payload ?? {};
+    if (username === '' && typeof payload.username === 'string') username = payload.username;
+    if (password === '' && typeof payload.password === 'string') password = payload.password;
+  } catch {
+    // A credential store that cannot answer simply leaves the values empty.
+  }
+  return { username, password };
+}
+
+/**
+ * Describe one plug for tool output without leaking its token.
+ * @param plug - Resolved plug descriptor.
+ * @returns Safe descriptor.
+ */
+function publicPlug(plug) {
+  return {
+    host: plug.host,
+    did: plug.did,
+    name: plug.name,
+    model: plug.model,
+    source: plug.source,
+    tokenConfigured: plug.token !== '',
+  };
+}
+
+/**
+ * Undo the durable parts of a cold boot that never reached the power cut.
+ * @param deps - Plugin dependencies.
+ * @param scheduleId - Continuation task to delete.
+ * @param callerSessionId - Acting session.
+ */
+async function rollbackColdBoot(deps, scheduleId, callerSessionId) {
+  if (scheduleId !== undefined && scheduleId !== null) {
+    await deleteScheduledTask(deps.schedule, scheduleId, callerSessionId, deps.log);
+  }
+  await removeState(deps.stateFile).catch(() => {});
+}
+
+/**
+ * Cold boot: arm the continuation, arm the out-of-band power-on path, then cut
+ * mains power through the plug.
+ *
+ * Ordering is the safety property. Nothing is powered off until the
+ * continuation is durable and the restore command has succeeded, because the
+ * machine cannot turn its own power back on.
+ *
+ * @param ctx - Schedule-resolved plugin scope.
+ * @param rawArgs - Unvalidated model arguments.
+ * @param exec - Tool execution identity and caller agent.
+ * @param deps - Resolved config, state path, and logger.
+ * @returns The canonical tool value.
+ */
+async function runColdBoot(ctx, rawArgs, exec, deps) {
+  const { config, stateFile, log } = deps;
+  const coldBoot = config.coldBoot;
+  const parsed = parseArgs(rawArgs);
+  if (parsed.kind === 'error') return fail('invalid_arguments', parsed.message);
+  if (!coldBoot.enabled) {
+    return fail('cold_boot_disabled', '冷启动未启用：请在配置里设置 coldBoot.enabled = true。');
+  }
+
+  const agent = exec.agent;
+  if (agent === undefined) return fail('no_agent', '冷启动工具需要一个活动的会话。');
+  if (delegationDepth(agent) > 0) {
+    return fail('subagent_session', '子代理不能冷启动电脑；请在主会话中执行。');
+  }
+  const callerSessionId = agent.session.id;
+  const targetSessionId = parsed.targetSession === '' ? callerSessionId : parsed.targetSession;
+
+  let state = await inspectState(stateFile);
+  if (state.kind === 'corrupt') {
+    const cleared = await clearIfStaleCorrupt(stateFile, config, log);
+    if (!cleared) {
+      return fail('reboot_state_unreadable', `续跑状态文件无法解析：${stateFile}。请检查或删除该文件后重试。`);
+    }
+    state = { kind: 'none' };
+  }
+  if (state.kind === 'pending' && state.record.resumedAt === undefined) {
+    return fail(
+      'cold_boot_already_pending',
+      `已经有一个续跑请求在等待执行（计划任务 ${state.record.scheduleId}）。请等待它完成，或先取消该计划任务并删除 ${stateFile}。`,
+    );
+  }
+  if (state.kind === 'pending' && state.record.resumedAt !== undefined) {
+    await removeState(stateFile);
+  }
+
+  const account = await resolveAccount(ctx, coldBoot);
+  let plug;
+  let status = null;
+  let plugError = '';
+  try {
+    plug = await resolvePlug({
+      config: coldBoot,
+      cacheFile: coldBoot.cacheFile,
+      log,
+      credentials: account,
+    });
+    status = await plugStatus(plug);
+  } catch (error) {
+    plugError = safeErrorMessage(error);
+    log.warn(`cold boot plug resolution failed: ${plugError}`);
+  }
+
+  // A moved DHCP address is the common failure: when an account is available,
+  // re-read the cloud device list once and retry.
+  if (status === null && account.username !== '' && account.password !== '') {
+    try {
+      plug = await resolvePlug({
+        config: coldBoot,
+        cacheFile: coldBoot.cacheFile,
+        log,
+        credentials: account,
+        forceRefresh: true,
+      });
+      status = await plugStatus(plug);
+      plugError = '';
+    } catch (error) {
+      plugError = safeErrorMessage(error);
+    }
+  }
+
+  const plan = planColdBoot({ coldBoot, plugStatus: status });
+  if (plugError !== '' && status === null) {
+    plan.blockers.unshift(`插座不可达：${plugError}`);
+    plan.ok = false;
+  }
+
+  // Jump-host mode needs two things verified while the machine is still up:
+  // a usable cloud session for the pre-signed request, and SSH reachability
+  // plus the tools that send it. Both are read-only checks.
+  let jumpSession = null;
+  if (coldBoot.restore.mode === 'jump' && coldBoot.restore.jump.host !== '') {
+    const cache = await readCache(coldBoot.cacheFile);
+    jumpSession = cache?.session ?? null;
+    if (jumpSession === null) {
+      plan.blockers.push('跳板机模式需要小米云端会话：请先运行 tools/probe.mjs session 缓存会话（上电请求要用它签名）。');
+    } else if (plug !== undefined && plug.did !== '') {
+      try {
+        await cloudGetProperty({
+          session: jumpSession,
+          did: plug.did,
+          siid: plug.switchSpec.siid,
+          piid: plug.switchSpec.piid,
+        });
+      } catch (error) {
+        plan.blockers.push(`小米云端会话不可用：${safeErrorMessage(error)}`);
+      }
+    } else {
+      plan.blockers.push('跳板机模式需要插座的 did（云端设备 id），当前插座信息里没有。');
+    }
+    const jumpPreflight = await preflightJump({
+      host: coldBoot.restore.jump.host,
+      identity: coldBoot.restore.jump.identity,
+      sshOptions: coldBoot.restore.jump.sshOptions,
+      execFileImpl: execFile,
+    });
+    if (!jumpPreflight.ok) plan.blockers.push(jumpPreflight.detail);
+    else plan.steps.push(jumpPreflight.detail);
+  }
+  if (plan.blockers.length === 0) {
+    const haltPreflight = await probePowerPermission(coldBoot.haltCommand, 'poweroff');
+    if (!haltPreflight.ok) plan.blockers.push(haltPreflight.detail);
+    else plan.steps.push(haltPreflight.detail);
+  }
+  plan.ok = plan.blockers.length === 0;
+
+  if (parsed.dryRun) {
+    return {
+      ok: plan.ok,
+      dryRun: true,
+      code: plan.ok ? 'cold_boot_ready' : 'cold_boot_blocked',
+      message: plan.ok
+        ? `冷启动前置检查通过：插座 ${plug.host} 当前为 ${status.power}，恢复方式 ${coldBoot.restore.mode}。`
+        : `冷启动前置检查未通过：${plan.blockers.join(' ')}`,
+      plug: plug === undefined ? null : publicPlug(plug),
+      status,
+      plan,
+      restoreMode: coldBoot.restore.mode,
+      outageSeconds: coldBoot.outageSeconds,
+      approvalRequired: !config.allowUnattended,
+      sessionId: callerSessionId,
+      targetSessionId,
+    };
+  }
+
+  if (!plan.ok) {
+    return fail('cold_boot_blocked', `冷启动被拒绝：${plan.blockers.join(' ')}`, { plan });
+  }
+
+  let approvalState = 'skipped';
+  if (!config.allowUnattended) {
+    const approval = ctx.get('approval');
+    if (approval === undefined || typeof approval.request !== 'function') {
+      return fail('approval_unavailable', '当前运行环境没有可用的审批通道，未冷启动。');
+    }
+    const shortReason = truncate(reasonForDisplay(parsed.reason), MAX_APPROVAL_REASON);
+    const approvalRequest = {
+      agent,
+      toolName: COLD_BOOT_TOOL_NAME,
+      callId: exec.callId,
+      reason: `system_cold_boot: ${shortReason}`,
+      displayReason: {
+        en:
+          `Shut this computer down cleanly, cut mains power after ${coldBoot.powerCutDelaySeconds}s, `
+          + `restore power ${coldBoot.outageSeconds}s later, and continue this chat after it boots again.`
+          + `\n\nReason: ${shortReason}`
+          + `\n\nAll running applications will be closed now. The computer cannot power itself back on; `
+          + `restore mode is "${coldBoot.restore.mode}".`,
+        zh:
+          `先干净关机，${coldBoot.powerCutDelaySeconds} 秒后通过智能插座切断市电，`
+          + `${coldBoot.outageSeconds} 秒后重新上电，等电脑重启后自动继续本会话。`
+          + `\n\n原因：${shortReason}`
+          + `\n\n现在开始关闭所有正在运行的程序。电脑无法自行上电，恢复方式为“${coldBoot.restore.mode}”。`,
+      },
+    };
+    if (exec.signal !== undefined) approvalRequest.signal = exec.signal;
+    let outcome;
+    try {
+      outcome = await approval.request(approvalRequest);
+    } catch (error) {
+      if (exec.signal?.aborted) return fail('approval_cancelled', '冷启动请求已取消，未断电。');
+      log.warn(`approval request failed: ${safeErrorMessage(error)}`);
+      return fail('approval_failed', '审批请求失败，未断电。');
+    }
+    if (outcome !== 'allowed-once') {
+      return fail(`approval_${String(outcome)}`, '没有获得冷启动许可，未断电。');
+    }
+    approvalState = 'allowed-once';
+  }
+
+  const continuationId = randomUUID();
+  const fallbackSeconds = coldBoot.shutdownGraceSeconds
+    + coldBoot.powerCutDelaySeconds
+    + coldBoot.outageSeconds
+    + config.fallbackDelaySeconds;
+  let entry;
+  try {
+    entry = await deps.schedule.create(
+      {
+        title: buildScheduleTitle(parsed.reason, '冷启动续跑'),
+        prompt: buildResumePrompt({
+          continuationId,
+          reason: parsed.reason,
+          custom: parsed.resumePrompt,
+          tool: COLD_BOOT_TOOL_NAME,
+        }),
+        timing: { kind: 'after', after_seconds: fallbackSeconds },
+        target: { kind: 'session', sessionId: targetSessionId },
+      },
+      callerSessionId,
+      exec.signal,
+    );
+  } catch (error) {
+    log.warn(`could not create the cold-boot continuation task: ${safeErrorMessage(error)}`);
+    return fail('schedule_failed', '无法创建自动续跑任务，未断电。');
+  }
+
+  const bootId = await readBootId();
+  const record = {
+    version: STATE_VERSION,
+    kind: 'cold-boot',
+    continuationId,
+    scheduleId: entry.id,
+    sessionId: targetSessionId,
+    bootId,
+    createdAt: new Date().toISOString(),
+    reason: truncate(parsed.reason, MAX_REASON),
+    plug: publicPlug(plug),
+    restoreMode: coldBoot.restore.mode,
+    powerCutDelaySeconds: coldBoot.powerCutDelaySeconds,
+    outageSeconds: coldBoot.outageSeconds,
+  };
+  try {
+    await createPending(stateFile, record);
+  } catch (error) {
+    await rollbackColdBoot(deps, entry.id, callerSessionId);
+    if (String(error?.code ?? '') === 'EEXIST') {
+      return fail('cold_boot_already_pending', '另一个续跑请求已排入队列；本次未断电。');
+    }
+    log.warn(`could not persist cold-boot state: ${safeErrorMessage(error)}`);
+    return fail('state_write_failed', '无法保存自动续跑状态，未断电。');
+  }
+  await recordEvent(config, {
+    event: 'cold-boot-armed',
+    scheduleId: String(entry.id),
+    targetSessionId: String(targetSessionId),
+    plugHost: plug.host,
+    restoreMode: coldBoot.restore.mode,
+  });
+
+  // Arm the out-of-band power cycle before the machine loses the ability to
+  // act at all: the jump host must cut power after the shutdown and restore it
+  // after the discharge. A failure here aborts while the machine is still up.
+  if (coldBoot.restore.mode === 'jump') {
+    let armed;
+    try {
+      const common = {
+        session: jumpSession,
+        did: plug.did,
+        siid: plug.switchSpec.siid,
+        piid: plug.switchSpec.piid,
+        apiHost: coldBoot.restore.jump.apiHost,
+      };
+      const offRequest = buildPowerRequest({ ...common, value: false });
+      const onRequest = buildPowerRequest({ ...common, value: true });
+      armed = await armJumpRestore({
+        host: coldBoot.restore.jump.host,
+        identity: coldBoot.restore.jump.identity,
+        sshOptions: coldBoot.restore.jump.sshOptions,
+        offRequestBase64: offRequest.base64,
+        onRequestBase64: onRequest.base64,
+        powerCutDelaySeconds: coldBoot.powerCutDelaySeconds,
+        outageSeconds: coldBoot.outageSeconds,
+        shutdownGraceSeconds: coldBoot.shutdownGraceSeconds,
+        apiHost: coldBoot.restore.jump.apiHost,
+        execFileImpl: execFile,
+      });
+      await recordEvent(config, {
+        event: 'cold-boot-jump-armed',
+        ok: armed.ok,
+        host: coldBoot.restore.jump.host,
+        powerCutInSeconds: coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds,
+        powerOnInSeconds: coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds + coldBoot.outageSeconds,
+        offRequestBytes: offRequest.bytes,
+        onRequestBytes: onRequest.bytes,
+      });
+    } catch (error) {
+      armed = { ok: false, detail: safeErrorMessage(error) };
+    }
+    if (!armed.ok) {
+      await rollbackColdBoot(deps, entry.id, callerSessionId);
+      return fail(
+        'restore_failed',
+        `无法把断电/上电请求交给跳板机，已在关机前中止：${truncate(armed.detail ?? '', 300)}`,
+      );
+    }
+  } else if (coldBoot.restore.mode === 'command') {
+    const restore = await runRestoreCommand({
+      command: coldBoot.restore.command,
+      timeoutMs: 15000,
+      execFile,
+      log,
+    });
+    await recordEvent(config, {
+      event: 'cold-boot-restore-armed',
+      ok: restore.ok,
+      detail: truncate(restore.detail ?? '', 400),
+    });
+    if (!restore.ok) {
+      await rollbackColdBoot(deps, entry.id, callerSessionId);
+      return fail(
+        'restore_failed',
+        `外部恢复命令执行失败，已在关机前中止：${truncate(restore.detail ?? '', 300)}`,
+      );
+    }
+  } else {
+    log.warn('cold boot with manual restore: the user must power the plug back on');
+  }
+
+  if (exec.signal?.aborted) {
+    await rollbackColdBoot(deps, entry.id, callerSessionId);
+    return fail('cancelled', '冷启动请求在关机前被取消。');
+  }
+
+  // Clean shutdown first; the jump host cuts power later. This avoids a hard
+  // power cut while the kernel is still writing.
+  try {
+    await fs.access('/bin/sh', fsConstants.X_OK);
+    await recordEvent(config, {
+      event: 'cold-boot-halt-spawned',
+      scheduleId: String(entry.id),
+      command: coldBoot.haltCommand.join(' '),
+      graceSeconds: coldBoot.shutdownGraceSeconds,
+    });
+    (deps.spawnHalt ?? spawnHalt)(coldBoot, log);
+  } catch (error) {
+    await rollbackColdBoot(deps, entry.id, callerSessionId);
+    log.warn(`could not launch the shutdown: ${safeErrorMessage(error)}`);
+    return fail('halt_spawn_failed', '无法启动关机命令，未关机；跳板机上的断电/上电计划仍会执行，请手动取消或等待。');
+  }
+
+  try {
+    exec.concludeTurn?.();
+  } catch {
+    // The durable continuation is already stored; a failed close is not fatal.
+  }
+
+  return {
+    ok: true,
+    code: 'cold_boot_started',
+    message:
+      `${approvalState === 'skipped' ? '本 profile 已允许无人值守操作，本次跳过审批。' : ''}`
+      + `正在关机；跳板机会在约 ${coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds} 秒后断电，`
+      + `${coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds + coldBoot.outageSeconds} 秒后上电。`
+      + `自动续跑已排入本会话；DSH 启动后会按 boot id 立即续跑，`
+      + `兜底计划任务在约 ${fallbackSeconds} 秒时交付。`,
+    approval: approvalState,
+    plug: publicPlug(plug),
+    status,
+    plan,
+    restoreMode: coldBoot.restore.mode,
+    continuationId,
+    scheduleId: entry.id,
+    sessionId: callerSessionId,
+    targetSessionId,
+    powerCutInSeconds: coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds,
+    powerOnInSeconds: coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds + coldBoot.outageSeconds,
+    fallbackInSeconds: fallbackSeconds,
+  };
+}
+
+/**
  * Deliver a recorded continuation after a new boot.
  * @param ctx - Schedule-resolved plugin scope.
  * @param deps - Resolved config, state path, and logger.
  */
-async function resumeAfterBoot(schedule, deps) {
-  const { config, stateFile, log } = deps;
+async function resumeAfterBoot(schedule, deps) {  const { config, stateFile, log } = deps;
   const state = await inspectState(stateFile);
   if (state.kind === 'none') return;
   if (state.kind === 'corrupt') {
@@ -962,16 +1468,27 @@ async function readBootId() {
  * @returns Permission probe result.
  */
 async function probeRebootPermission(config) {
+  return probePowerPermission(config.rebootCommand, 'reboot');
+}
+
+/**
+ * Verify that a power action can run without an interactive prompt.
+ * @param command - Configured argv (`systemctl reboot`, `systemctl poweroff`, or sudo).
+ * @param action - `reboot` or `poweroff`; selects the PolicyKit question.
+ * @returns Permission probe result.
+ */
+async function probePowerPermission(command, action) {
+  const label = action === 'poweroff' ? '关机' : '重启';
   if (process.platform !== 'linux') {
     return {
       ok: false,
       method: 'unsupported',
       canReboot: 'unsupported',
-      detail: 'system_reboot 目前只支持 Linux + systemd。',
+      detail: `system_${action === 'poweroff' ? 'cold_boot' : 'reboot'} 目前只支持 Linux + systemd。`,
     };
   }
 
-  const executable = config.rebootCommand[0];
+  const executable = command[0];
   if (executable === 'sudo') {
     const probe = await runCommand('sudo', ['-n', 'true'], 5000);
     if (probe.exitCode === 0 && probe.errorCode === undefined) {
@@ -985,16 +1502,23 @@ async function probeRebootPermission(config) {
     };
   }
 
-  let probe = await runCommand('busctl', LOGIN1_REBOOT_ARGS, 5000);
+  const busArgs = [
+    'call',
+    'org.freedesktop.login1',
+    '/org/freedesktop/login1',
+    'org.freedesktop.login1.Manager',
+    action === 'poweroff' ? 'CanPowerOff' : 'CanReboot',
+  ];
+  let probe = await runCommand('busctl', busArgs, 5000);
   if (probe.errorCode === 'ENOENT') {
-    probe = await runCommand('/usr/bin/busctl', LOGIN1_REBOOT_ARGS, 5000);
+    probe = await runCommand('/usr/bin/busctl', busArgs, 5000);
   }
   if (probe.errorCode !== undefined || probe.exitCode !== 0) {
     const detail = truncate(
       probe.stderr.trim() !== '' ? probe.stderr.trim() : (probe.message || '无法查询 systemd-logind。'),
       300,
     );
-    return { ok: false, method: 'busctl', canReboot: 'unknown', detail: `无法查询重启权限：${detail}` };
+    return { ok: false, method: 'busctl', canReboot: 'unknown', detail: `无法查询${label}权限：${detail}` };
   }
   const match = /s\s+"(yes|no|challenge|na)"/.exec(probe.stdout);
   const answer = match?.[1];
@@ -1003,7 +1527,7 @@ async function probeRebootPermission(config) {
       ok: true,
       method: 'polkit',
       canReboot: 'yes',
-      detail: 'PolicyKit 允许此进程无需交互即可重启。',
+      detail: `PolicyKit 允许此进程无需交互即可${label}。`,
     };
   }
   if (answer === 'challenge') {
@@ -1012,16 +1536,19 @@ async function probeRebootPermission(config) {
       method: 'polkit',
       canReboot: 'challenge',
       detail:
-        'PolicyKit 需要交互认证才能重启。请把 DSH 放在活动桌面会话中运行、添加允许'
-        + ' org.freedesktop.login1.reboot 的 polkit 规则，或把 rebootCommand 配成 '
-        + "['sudo','-n','systemctl','reboot']（需 NOPASSWD）。",
+        `PolicyKit 需要交互认证才能${label}（Can${action === 'poweroff' ? 'PowerOff' : 'Reboot'}=challenge）。`
+        + 'DSH 以 systemd user service 运行，没有自己的 logind session，所以'
+        + ' `allow_active=yes` 不适用，只能走 `auth_admin_keep`：登录后的临时授权过期后就会变成 challenge。'
+        + ' 装一条 polkit 规则即可固定放行：把 docs/polkit/49-dsh-power.rules 安装到'
+        + ' /etc/polkit-1/rules.d/（见 README「polkit 权限」），或用 NOPASSWD sudo 并配置'
+        + " ['sudo','-n','systemctl',...] 。",
     };
   }
   return {
     ok: false,
     method: 'polkit',
     canReboot: answer ?? 'unknown',
-    detail: `PolicyKit 未授权重启（CanReboot=${answer ?? 'unknown'}）。`,
+    detail: `PolicyKit 未授权${label}（Can${action === 'poweroff' ? 'PowerOff' : 'Reboot'}=${answer ?? 'unknown'}）。`,
   };
 }
 
@@ -1080,18 +1607,52 @@ function spawnReboot(config, log) {
 }
 
 /**
+ * Invoke the shutdown command after a short grace period, so the tool result
+ * and the closed turn reach durable storage before systemd stops the Host.
+ * The jump host cuts mains power later; that is a separate timer.
+ * @param coldBoot - Normalized cold-boot config.
+ * @param log - Plugin logger.
+ */
+function spawnHalt(coldBoot, log) {
+  // A test must never be able to power the machine off. The tests also inject
+  // a harmless halt command, but this guard makes an accident impossible.
+  if (process.env.NODE_TEST_CONTEXT !== undefined) {
+    log.warn('refusing to spawn the shutdown command from a test process');
+    return false;
+  }
+  const [executable, ...args] = coldBoot.haltCommand;
+  const script = `sleep ${coldBoot.shutdownGraceSeconds}; exec "$@"`;
+  const child = spawn('/bin/sh', ['-c', script, 'dsh-halt', executable, ...args], {
+    detached: true,
+    stdio: 'ignore',
+    env: process.env,
+  });
+  child.on('error', (error) => {
+    log.warn(`shutdown launcher failed: ${safeErrorMessage(error)}`);
+  });
+  child.unref();
+  return true;
+}
+
+/**
  * Build the continuation prompt stored in the Schedule task.
  * @param input - Continuation identity, reason, and optional custom prompt.
  * @returns The prompt delivered after the reboot.
  */
-function buildResumePrompt({ continuationId, reason, custom }) {
+function buildResumePrompt({ continuationId, reason, custom, tool = TOOL_NAME }) {
+  const cold = tool === COLD_BOOT_TOOL_NAME;
   const lines = [
-    `[Automatic continuation after reboot / 重启后自动续跑 ${continuationId}]`,
-    'The computer was restarted through the system_reboot tool. DeepSeek Harness is running again.',
+    cold
+      ? `[Automatic continuation after cold boot / 冷启动后自动续跑 ${continuationId}]`
+      : `[Automatic continuation after reboot / 重启后自动续跑 ${continuationId}]`,
+    cold
+      ? 'The computer was power-cycled through the system_cold_boot tool (mains power was cut and restored). '
+        + 'DeepSeek Harness is running again.'
+      : 'The computer was restarted through the system_reboot tool. DeepSeek Harness is running again.',
     `Reboot reason: ${reason}`,
     'Continue the interrupted task from the conversation history. First verify that the reboot actually happened '
       + '(for example with `uptime`) and that the environment is healthy; then continue the remaining work.',
-    'If this continuation was already handled, confirm briefly and stop. Do not call system_reboot again unless '
+    `If this continuation was already handled, confirm briefly and stop. Do not call ${tool} again unless `
       + 'the user explicitly asks.',
   ];
   if (custom !== '') {
@@ -1105,9 +1666,9 @@ function buildResumePrompt({ continuationId, reason, custom }) {
  * @param reason - Reboot reason.
  * @returns A title accepted by the Schedule service.
  */
-function buildScheduleTitle(reason) {
+function buildScheduleTitle(reason, prefix = '重启续跑') {
   const compact = reason.replace(/\s+/g, ' ').trim();
-  const title = compact === '' ? '重启续跑' : `重启续跑：${compact}`;
+  const title = compact === '' ? prefix : `${prefix}：${compact}`;
   return truncate(title, MAX_TITLE);
 }
 
@@ -1227,6 +1788,7 @@ function resolveConfig(rawConfig) {
     rebootDelaySeconds: clampInteger(source.rebootDelaySeconds, 5, 2, 120),
     fallbackDelaySeconds: clampInteger(source.fallbackDelaySeconds, 90, 30, 3600),
     staleMs: clampInteger(source.staleAfterSeconds, 7 * 24 * 3600, 3600, 30 * 24 * 3600) * 1000,
+    coldBoot: normalizeColdBoot(source.coldBoot, { pendingDir }),
   };
 }
 
