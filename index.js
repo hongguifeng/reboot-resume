@@ -907,7 +907,9 @@ async function runColdBoot(ctx, rawArgs, exec, deps) {
       dryRun: true,
       code: plan.ok ? 'cold_boot_ready' : 'cold_boot_blocked',
       message: plan.ok
-        ? `冷启动前置检查通过：插座 ${plug.host} 当前为 ${status.power}，恢复方式 ${coldBoot.restore.mode}。`
+        ? `冷启动前置检查通过：插座 ${plug.host} 当前为 ${status.power}，恢复方式 ${coldBoot.restore.mode}；`
+          + `时序 关机缓冲 ${coldBoot.shutdownGraceSeconds}s / 关机后 ${coldBoot.powerCutDelaySeconds}s 断电 / `
+          + `断电 ${coldBoot.outageSeconds}s 后上电（约 ${coldBoot.shutdownGraceSeconds + coldBoot.powerCutDelaySeconds + coldBoot.outageSeconds}s 后上电）。`
         : `冷启动前置检查未通过：${plan.blockers.join(' ')}`,
       plug: plug === undefined ? null : publicPlug(plug),
       status,
