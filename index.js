@@ -27,7 +27,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { normalizeColdBoot, planColdBoot, runRestoreCommand } from './lib/cold-boot.js';
+import { effectiveTimings, normalizeColdBoot, planColdBoot, runRestoreCommand } from './lib/cold-boot.js';
 import { armJumpRestore, buildPowerRequest, preflightJump } from './lib/jump-host.js';
 import { plugStatus, readCache, resolvePlug } from './lib/plug.js';
 import { cloudGetProperty } from './lib/xiaomi-cloud.js';
@@ -99,7 +99,8 @@ const COLD_BOOT_DESCRIPTION =
   + 'continuation, then hands the delayed power cut and restore to the configured out-of-band restore path, then '
   + 'shuts the machine down; the machine cannot power itself back on. Never claim anything happened before the tool '
   + 'returns `cold_boot_started`. Set `dry_run` to inspect the plug, the restore path, and the planned sequence '
-  + 'without changing anything.';
+  + 'without changing anything. `shutdown_grace_seconds`, `power_cut_delay_seconds`, and `outage_seconds` override '
+  + 'the profile timings for this one call (clamped to safe ranges) when the task needs a shorter or longer outage.';
 
 /** System-prompt guidance for the cold boot tool. */
 const COLD_BOOT_PROMPT =
@@ -158,6 +159,38 @@ const PARAMETERS_SCHEMA = {
     },
   },
   required: ['reason'],
+};
+
+/** Raw JSON Schema for the cold-boot arguments (timings are per-call overridable). */
+const COLD_BOOT_PARAMETERS_SCHEMA = {
+  ...PARAMETERS_SCHEMA,
+  properties: {
+    ...PARAMETERS_SCHEMA.properties,
+    shutdown_grace_seconds: {
+      type: 'integer',
+      minimum: 2,
+      maximum: 60,
+      description:
+        'Seconds between starting the shutdown and the host actually going down, so the tool result reaches durable '
+        + 'storage first. Defaults to the profile value (5). Allowed range 2-60.',
+    },
+    power_cut_delay_seconds: {
+      type: 'integer',
+      minimum: 10,
+      maximum: 300,
+      description:
+        'Seconds after the shutdown starts before the plug cuts mains power. Must be long enough for the shutdown to '
+        + 'finish; values below 10 are rejected. Defaults to the profile value (30).',
+    },
+    outage_seconds: {
+      type: 'integer',
+      minimum: 10,
+      maximum: 600,
+      description:
+        'Seconds the machine stays unpowered so the PSU fully discharges. Too short and the BIOS may not treat the '
+        + 'next power-on as a cold boot. Defaults to the profile value (30).',
+    },
+  },
 };
 
 /** Raw JSON Schema for the canonical result. */
@@ -398,7 +431,7 @@ function registerTool(ctx, deps) {
     disposers.push(ctx.tools.register({
       name: COLD_BOOT_TOOL_NAME,
       description: COLD_BOOT_DESCRIPTION,
-      parameters: PARAMETERS_SCHEMA,
+      parameters: COLD_BOOT_PARAMETERS_SCHEMA,
       output: { schema: OUTPUT_SCHEMA, render },
       presentCall(rawArgs) {
         const reason = rawArgs && typeof rawArgs === 'object' && typeof rawArgs.reason === 'string'
@@ -753,12 +786,14 @@ async function rollbackColdBoot(deps, scheduleId, callerSessionId) {
  */
 async function runColdBoot(ctx, rawArgs, exec, deps) {
   const { config, stateFile, log } = deps;
-  const coldBoot = config.coldBoot;
-  const parsed = parseArgs(rawArgs);
+  const base = config.coldBoot;
+  const parsed = parseArgs(rawArgs, { coldBoot: true });
   if (parsed.kind === 'error') return fail('invalid_arguments', parsed.message);
-  if (!coldBoot.enabled) {
+  if (!base.enabled) {
     return fail('cold_boot_disabled', '冷启动未启用：请在配置里设置 coldBoot.enabled = true。');
   }
+  // Per-call overrides win over the profile values, clamped to safe ranges.
+  const coldBoot = { ...base, ...effectiveTimings(base, parsed.timings) };
 
   const agent = exec.agent;
   if (agent === undefined) return fail('no_agent', '冷启动工具需要一个活动的会话。');
@@ -878,7 +913,11 @@ async function runColdBoot(ctx, rawArgs, exec, deps) {
       status,
       plan,
       restoreMode: coldBoot.restore.mode,
-      outageSeconds: coldBoot.outageSeconds,
+      timings: {
+        shutdownGraceSeconds: coldBoot.shutdownGraceSeconds,
+        powerCutDelaySeconds: coldBoot.powerCutDelaySeconds,
+        outageSeconds: coldBoot.outageSeconds,
+      },
       approvalRequired: !config.allowUnattended,
       sessionId: callerSessionId,
       targetSessionId,
@@ -1105,6 +1144,11 @@ async function runColdBoot(ctx, rawArgs, exec, deps) {
     scheduleId: entry.id,
     sessionId: callerSessionId,
     targetSessionId,
+    timings: {
+      shutdownGraceSeconds: coldBoot.shutdownGraceSeconds,
+      powerCutDelaySeconds: coldBoot.powerCutDelaySeconds,
+      outageSeconds: coldBoot.outageSeconds,
+    },
     powerCutInSeconds: coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds,
     powerOnInSeconds: coldBoot.powerCutDelaySeconds + coldBoot.shutdownGraceSeconds + coldBoot.outageSeconds,
     fallbackInSeconds: fallbackSeconds,
@@ -1686,11 +1730,19 @@ function reasonForDisplay(reason) {
  * @param rawArgs - Unvalidated arguments.
  * @returns A parsed value or a validation error.
  */
-function parseArgs(rawArgs) {
+function parseArgs(rawArgs, options = {}) {
   if (rawArgs === null || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) {
     return { kind: 'error', message: '参数必须是一个对象。' };
   }
   const allowed = new Set(['reason', 'resume_prompt', 'target_session', 'dry_run']);
+  const timingFields = [
+    ['shutdown_grace_seconds', 'shutdownGraceSeconds'],
+    ['power_cut_delay_seconds', 'powerCutDelaySeconds'],
+    ['outage_seconds', 'outageSeconds'],
+  ];
+  if (options.coldBoot === true) {
+    for (const [field] of timingFields) allowed.add(field);
+  }
   for (const key of Object.keys(rawArgs)) {
     if (!allowed.has(key)) return { kind: 'error', message: `未知参数：${key}` };
   }
@@ -1726,7 +1778,18 @@ function parseArgs(rawArgs) {
   if (rawArgs.dry_run !== undefined && typeof rawArgs.dry_run !== 'boolean') {
     return { kind: 'error', message: '`dry_run` 必须是布尔值。' };
   }
-  return { kind: 'ok', reason, resumePrompt, targetSession, dryRun: rawArgs.dry_run === true };
+  const timings = {};
+  if (options.coldBoot === true) {
+    for (const [field, key] of timingFields) {
+      const value = rawArgs[field];
+      if (value === undefined) continue;
+      if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+        return { kind: 'error', message: `\`${field}\` 必须是正整数秒数。` };
+      }
+      timings[key] = value;
+    }
+  }
+  return { kind: 'ok', reason, resumePrompt, targetSession, dryRun: rawArgs.dry_run === true, timings };
 }
 
 /**

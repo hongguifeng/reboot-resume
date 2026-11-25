@@ -1,6 +1,6 @@
 {
   "name": "@local/reboot-resume",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "Lets the agent reboot the computer and automatically continue the interrupted session after DSH restarts.",
   "type": "module",

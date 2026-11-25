@@ -240,6 +240,80 @@ test('cold boot schedules the continuation, arms restore, then cuts power', asyn
   });
 });
 
+test('per-call timings override the profile values', async () => {
+  await withRig(async ({ pendingDir, context, tasks }) => {
+    loadPlugin({
+      context,
+      pendingDir,
+      coldBoot: {
+        enabled: true,
+        haltCommand: ['/bin/true'],
+        restore: { mode: 'command', command: ['/bin/true'] },
+        shutdownGraceSeconds: 5,
+        powerCutDelaySeconds: 30,
+        outageSeconds: 20,
+      },
+    });
+    const tool = context.tools.get('system_cold_boot');
+    const result = await tool.execute(
+      { reason: '自定义时序', shutdown_grace_seconds: 3, power_cut_delay_seconds: 45, outage_seconds: 60 },
+      { agent: { session: { id: 's-1' } } },
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.timings.shutdownGraceSeconds, 3);
+    assert.equal(result.timings.powerCutDelaySeconds, 45);
+    assert.equal(result.timings.outageSeconds, 60);
+    // 3 + 45 + 60 + 90 fallback
+    assert.equal(tasks[0].timing.after_seconds, 3 + 45 + 60 + 90);
+    const record = JSON.parse(await fs.readFile(path.join(pendingDir, 'pending.json'), 'utf8'));
+    assert.equal(record.powerCutDelaySeconds, 45);
+    assert.equal(record.outageSeconds, 60);
+  });
+});
+
+test('per-call timings are clamped to the safe ranges', async () => {
+  await withRig(async ({ pendingDir, context }) => {
+    loadPlugin({
+      context,
+      pendingDir,
+      coldBoot: {
+        enabled: true,
+        haltCommand: ['/bin/true'],
+        restore: { mode: 'command', command: ['/bin/true'] },
+        outageSeconds: 30,
+      },
+    });
+    const tool = context.tools.get('system_cold_boot');
+    const result = await tool.execute(
+      { reason: '越界时序', power_cut_delay_seconds: 1, outage_seconds: 5, shutdown_grace_seconds: 1 },
+      { agent: { session: { id: 's-1' } } },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.timings.shutdownGraceSeconds, 2);
+    assert.equal(result.timings.powerCutDelaySeconds, 10);
+    assert.equal(result.timings.outageSeconds, 10);
+  });
+});
+
+test('a non-integer timing is rejected before doing anything', async () => {
+  await withRig(async ({ pendingDir, context, tasks }) => {
+    loadPlugin({
+      context,
+      pendingDir,
+      coldBoot: { enabled: true, haltCommand: ['/bin/true'], restore: { mode: 'command', command: ['/bin/true'] } },
+    });
+    const tool = context.tools.get('system_cold_boot');
+    const result = await tool.execute(
+      { reason: '坏参数', outage_seconds: 'lots' },
+      { agent: { session: { id: 's-1' } } },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'invalid_arguments');
+    assert.equal(tasks.length, 0);
+  });
+});
+
 test('a failed restore command aborts before the power cut and rolls back', async () => {
   await withRig(async ({ fake, pendingDir, context, tasks }) => {
     loadPlugin({

@@ -287,11 +287,31 @@ ssh -i ~/.ssh/dsh_jump -o BatchMode=yes admin@192.168.8.2 \
 
 ### 模型怎么调用
 
-工具名：`system_cold_boot`，参数与 `system_reboot` 相同（`reason` 必填，`resume_prompt`、`target_session`、`dry_run` 可选）。
+工具名：`system_cold_boot`。除通用参数（`reason` 必填，`resume_prompt`、`target_session`、`dry_run` 可选）外，
+每次调用还可以覆盖三个时间参数——**按单次任务自由设置，不需要改配置**：
+
+| 参数 | 范围 | 默认（配置值） | 含义 |
+| --- | --- | --- | --- |
+| `shutdown_grace_seconds` | 2–60 | 5 | 调用关机前的缓冲，保证工具结果先落盘 |
+| `power_cut_delay_seconds` | 10–300 | 30 | 关机开始后多久断电；太小会切断仍在关机的系统 |
+| `outage_seconds` | 10–600 | 30 | 断电保持多久（等电源放电，保证 BIOS 认为是冷启动） |
+
+越界值会被**夹取**到范围内（不会报错），非整数/非正数会被拒绝（`invalid_arguments`）。
+不传就用 `coldBoot` 里的配置值，所以"默认时序"和"按次自定义"可以共存。
 
 ```json
-{ "reason": "安装新驱动后需要真正断电让 PCIe 设备重新枚举", "dry_run": true }
+{
+  "reason": "PCIe 设备需要冷启动重新枚举，这次多放一会儿电",
+  "power_cut_delay_seconds": 40,
+  "outage_seconds": 60
+}
 ```
+
+跳板机的时序由这三个值派生：`sleep (shutdown_grace + power_cut_delay)` 后断电，再 `sleep outage` 后上电；
+兜底计划任务按 `shutdown_grace + power_cut_delay + outage + fallbackDelaySeconds` 到期。
+
+`dry_run` 会返回：插座信息（掩码后的 token 状态）、继电器状态、`restore.mode`、生效的 `timings`、
+以及 `plan.blockers`（为什么现在不能冷启动）和 `plan.warnings`。常见返回码：
 
 `dry_run` 会返回：插座信息（掩码后的 token 状态）、继电器状态、`restore.mode`、以及 `plan.blockers`
 （为什么现在不能冷启动）和 `plan.warnings`。常见返回码：
