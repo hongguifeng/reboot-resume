@@ -261,12 +261,16 @@ restore:
 # 1) 生成专用 key（一次性）
 ssh-keygen -t ed25519 -f ~/.ssh/dsh_jump -N '' -C 'dsh-reboot-resume jump host'
 
-# 2) 把公钥写进路由器的持久存储
-#    /etc/storage/dsh_authorized_keys   （持久）
-#    /home/root/.ssh/authorized_keys    （运行时；/home 是 tmpfs，重启会丢）
+# 2) 把公钥写到路由器上
+#    /etc/storage/dsh_authorized_keys    （要 save 才进 flash）
+#    /home/root/.ssh/authorized_keys     （运行时；/home 与 /etc 都是 tmpfs，重启会丢）
 #    并在 /etc/storage/started_script.sh 末尾追加一段开机恢复脚本
+#
+# 3) 关键一步：Padavan 的 /etc/storage 在 tmpfs 上，必须提交到 flash，
+#    否则路由器一重启 key 和开机脚本就没了（症状：Permission denied (publickey,password)）
+/sbin/mtd_storage.sh save
 
-# 3) 验证
+# 4) 验证
 ssh -i ~/.ssh/dsh_jump -o BatchMode=yes admin@192.168.8.2 \
   'openssl version >/dev/null 2>&1 && echo ok | base64 >/dev/null 2>&1 && echo dsh-jump-ok'
 ```
@@ -275,6 +279,11 @@ ssh -i ~/.ssh/dsh_jump -o BatchMode=yes admin@192.168.8.2 \
 
 要撤销这套改动：删掉 `/etc/storage/dsh_authorized_keys`、`/home/root/.ssh/authorized_keys`，
 以及 `started_script.sh` 里 `# >>> dsh-reboot-resume jump host >>>` 那一段，并删除 `~/.ssh/dsh_jump*`。
+
+> ⚠️ 这台路由器（Padavan）的 `/etc`、`/home` 都是 tmpfs。只写 `/etc/storage` **不会**持久化，
+> 必须 `/sbin/mtd_storage.sh save`（等价于 Web 界面的"保存设置"）。我在 2026-11-25 首次配置时漏了这一步，
+> 路由器在 11-28 重启后 key 与开机脚本一起消失，冷启动的跳板机预检就报
+> `admin@192.168.8.2: Permission denied (publickey,password)`。11-28 已补装并 save 成功。
 
 **失败模式**：跳板机没执行、云端会话过期（`serviceToken` 约 30 天）或插座离线时，电脑会停在断电状态，
 需要人工上电。`dry_run` 会先检查云端会话、SSH 可达性和跳板机工具，把这三类问题挡在断电之前。
